@@ -1,7 +1,6 @@
-use anathema::default_widgets::CanvasAttribs;
 use anathema::state::Hex;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Style, Theme, ThemeSet};
+use syntect::highlighting::{FontStyle, Style, Theme};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
@@ -42,7 +41,6 @@ pub struct Line<'a> {
 
 pub fn highlight<'a>(src: &'a str, ext: &str, theme: &Theme) -> Box<[Line<'a>]> {
     let ps = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
 
     // let ts = ThemeSet::load_defaults();
     // let theme = &ts.themes["base16-eighties.dark"];
@@ -52,7 +50,6 @@ pub fn highlight<'a>(src: &'a str, ext: &str, theme: &Theme) -> Box<[Line<'a>]> 
 
     let mut output = vec![];
 
-    let mut n = 0;
     for line in LinesWithEndings::from(src) {
         let mut head = h
             .highlight_line(line, &ps)

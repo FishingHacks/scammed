@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use anathema::state::Hex;
 
 use crate::instruction::Instruction;

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use actions::{parse_actions, Action};
 use anathema::backend::tui::Screen;
-use anathema::component::{ComponentId, Emitter};
+use anathema::component::ComponentId;
 use anathema::prelude::*;
 use command::{run_command, run_command_quiet};
 use crossterm::cursor::MoveTo;

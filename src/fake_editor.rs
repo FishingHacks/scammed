@@ -1,12 +1,11 @@
 use std::{env, path::PathBuf, sync::mpsc::Sender};
 
 use anathema::component::*;
-use anathema::default_widgets::{CanvasAttribs, Overflow};
+use anathema::default_widgets::Overflow;
 use anathema::geometry::{Pos, Size};
 use anathema::prelude::Context;
 use anathema::state::Hex;
 
-use crate::file_tree::empty_folder;
 use crate::{
     file_tree::{get_path_list, read_file_tree, Folder},
     instruction::Instruction,
@@ -121,7 +120,6 @@ impl Doc {
         let mut folder_list = get_path_list(&dir, new_focused);
         match folder_list.pop_back() {
             Some(v) => self.file_name = v,
-            Some(..) => (),
             None => self.file_name.to_mut().clear(),
         }
 
@@ -133,9 +131,7 @@ impl Doc {
 
 pub struct Editor {
     cursor: Pos,
-    cell_attribs: CanvasAttribs,
     foreground: Hex,
-    instructions: Vec<Instruction>,
     ack: Sender<()>,
 }
 
@@ -143,9 +139,7 @@ impl Editor {
     pub fn new(ack: Sender<()>) -> Self {
         Self {
             cursor: Pos::ZERO,
-            cell_attribs: CanvasAttribs::new(),
             foreground: Hex::from((255, 255, 255)),
-            instructions: vec![],
             ack,
         }
     }
@@ -191,12 +185,7 @@ impl Editor {
             let size = el.size();
             let vp = el.to::<Overflow>();
 
-            match &inst {
-                Instruction::MoveCursor(x, y) => {
-                    self.cursor.x = *x as i32;
-                    self.cursor.y = *y as i32;
-                    self.update_cursor(doc, vp, size);
-                }
+            match inst {
                 Instruction::Type(c, bold) => {
                     {
                         let mut lines = doc.lines.to_mut();
@@ -204,36 +193,26 @@ impl Editor {
                         let mut line = line.to_mut();
                         line.spans.insert(
                             self.cursor.x as usize,
-                            Span::new(*c, self.foreground, *bold),
+                            Span::new(c, self.foreground, bold),
                         );
                         self.cursor.x += 1;
                     }
 
                     self.update_cursor(doc, vp, size);
                 }
-                Instruction::SetForeground(hex) => self.foreground = *hex,
+                Instruction::SetForeground(hex) => self.foreground = hex,
                 Instruction::Newline { x } => {
-                    self.cursor.x = *x;
+                    self.cursor.x = x;
                     self.cursor.y += 1;
                     self.update_cursor(doc, vp, size);
                 }
                 Instruction::SetX(x) => {
-                    self.cursor.x = *x as i32;
+                    self.cursor.x = x as i32;
                     self.update_cursor(doc, vp, size);
                 }
                 Instruction::Pause(_) => unreachable!(),
                 Instruction::Wait => doc.waiting.set(true.to_string()),
-                Instruction::HideCursor => {
-                    doc.show_cursor.set(false);
-                }
                 Instruction::WaitForQuit => {}
-                Instruction::UpdateState(new_focused, new_transmitter) => {
-                    self.ack = new_transmitter.clone();
-                    doc.update_state(
-                        new_focused.display().to_string().into(),
-                        new_focused.clone(),
-                    );
-                }
             }
         });
     }
@@ -245,20 +224,20 @@ impl Component for Editor {
 
     fn on_key(
         &mut self,
-        key: KeyEvent,
+        _: KeyEvent,
         state: &mut Self::State,
-        mut elements: Elements<'_, '_>,
+        _: Elements<'_, '_>,
         _: Context<'_>,
     ) {
         state.waiting.set(false.to_string());
-        self.ack.send(());
+        _ = self.ack.send(());
     }
 
     fn message(
         &mut self,
         inst: Self::Message,
         state: &mut Self::State,
-        mut elements: Elements<'_, '_>,
+        elements: Elements<'_, '_>,
         _: Context<'_>,
     ) {
         self.apply_inst(inst, state, elements);
