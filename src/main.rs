@@ -1,261 +1,285 @@
+use core::str;
+use std::env;
+use std::env::home_dir;
+use std::fmt::Display;
 use std::fs::read_to_string;
-use std::sync::mpsc::{self, Sender};
+use std::io::{Read, Write};
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use anathema::component::*;
-use anathema::default_widgets::{Canvas, CanvasAttribs, Overflow, Text};
-use anathema::geometry::{LocalPos, Pos, Size};
+use actions::{parse_actions, Action};
+use anathema::backend::tui::Screen;
+use anathema::component::{ComponentId, Emitter};
 use anathema::prelude::*;
-use anathema::state::Hex;
+use command::{run_command, run_command_quiet};
+use crossterm::cursor::MoveTo;
+use crossterm::style::{Color, Colored, ContentStyle, Stylize};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+};
+use crossterm::{cursor, ExecutableCommand};
+use fake_editor::{Doc, Editor};
+use quittable_backend::{QuittableTuiBackend, SHOULD_QUIT};
+use rand::Rng;
+use syntect::highlighting::ThemeSet;
 
 use self::instruction::Instruction;
 
+mod actions;
+mod command;
+mod fake_editor;
+mod file_tree;
 mod instruction;
 mod parse;
+mod quittable_backend;
 pub(crate) mod syntax;
 
-#[derive(State)]
-struct Line {
-    spans: Value<List<Span>>,
-}
+/// -----------------------
+/// CONFIGURATION
+/// -----------------------
 
-impl Line {
-    pub fn empty() -> Self {
-        Self {
-            spans: List::empty(),
-        }
-    }
-}
+const TYPING_DELAY_RANGE_MS: Range<u64> = 35..85;
 
-#[derive(State)]
-struct Span {
-    text: Value<char>,
-    bold: Value<bool>,
-    foreground: Value<Hex>,
-}
+/// -----------------------
 
-impl Span {
-    pub fn new(c: char, foreground: Hex, bold: bool) -> Self {
-        Self {
-            text: c.into(),
-            foreground: foreground.into(),
-            bold: bold.into(),
-        }
-    }
-
-    pub fn empty() -> Self {
-        Self {
-            text: ' '.into(),
-            foreground: Hex::from((255, 255, 255)).into(),
-            bold: false.into(),
-        }
-    }
-}
-
-#[derive(State)]
-struct Doc {
-    doc_height: Value<usize>,
-    screen_cursor_x: Value<i32>,
-    screen_cursor_y: Value<i32>,
-    buf_cursor_x: Value<i32>,
-    buf_cursor_y: Value<i32>,
-    lines: Value<List<Line>>,
-    current_instruction: Value<Option<String>>,
-    title: Value<String>,
-    waiting: Value<String>,
-    show_cursor: Value<bool>,
-}
-
-impl Doc {
-    pub fn new(title: String) -> Self {
-        Self {
-            doc_height: 1.into(),
-            screen_cursor_x: 0.into(),
-            screen_cursor_y: 0.into(),
-            buf_cursor_x: 0.into(),
-            buf_cursor_y: 0.into(),
-            lines: List::from_iter(vec![Line::empty()]),
-            current_instruction: None.into(),
-            title: title.into(),
-            waiting: false.to_string().into(),
-            show_cursor: true.into(),
-        }
-    }
-}
-
-struct Editor {
-    cursor: Pos,
-    cell_attribs: CanvasAttribs,
-    foreground: Hex,
-    instructions: Vec<Instruction>,
-    ack: Sender<()>,
-}
-
-impl Editor {
-    pub fn new(ack: Sender<()>) -> Self {
-        Self {
-            cursor: Pos::ZERO,
-            cell_attribs: CanvasAttribs::new(),
-            foreground: Hex::from((255, 255, 255)),
-            instructions: vec![],
-            ack,
-        }
-    }
-
-    fn update_cursor(&mut self, state: &mut Doc, overflow: &mut Overflow, size: Size) {
-        // Make sure there are enough lines and spans
-        while self.cursor.y as usize >= state.lines.len() {
-            state.lines.push_back(Line::empty());
-        }
-
-        {
-            let mut lines = state.lines.to_mut();
-            let line = lines.get_mut(self.cursor.y as usize).unwrap();
-
-            let spans = &mut line.to_mut().spans;
-            while self.cursor.x as usize > spans.len() {
-                spans.push_back(Span::empty());
-            }
-        }
-
-        let mut screen_cursor = self.cursor - overflow.offset();
-
-        if screen_cursor.y < 0 {
-            overflow.scroll_up_by(-screen_cursor.y);
-            screen_cursor.y = 0;
-        }
-
-        if screen_cursor.y >= size.height as i32 {
-            let offset = screen_cursor.y + 1 - size.height as i32;
-            overflow.scroll_down_by(offset);
-            screen_cursor.y = size.height as i32 - 1;
-        }
-
-        state.screen_cursor_x.set(screen_cursor.x);
-        state.screen_cursor_y.set(screen_cursor.y);
-        state.buf_cursor_x.set(self.cursor.x);
-        state.buf_cursor_y.set(self.cursor.y);
-    }
-
-    fn apply_inst(&mut self, inst: Instruction, doc: &mut Doc, mut elements: Elements<'_, '_>) {
-        doc.current_instruction.set(Some(format!("{inst:?}")));
-        elements.query().by_tag("overflow").first(|el, _| {
-            let size = el.size();
-            let vp = el.to::<Overflow>();
-
-            match inst {
-                Instruction::MoveCursor(x, y) => {
-                    self.cursor.x = x as i32;
-                    self.cursor.y = y as i32;
-                    self.update_cursor(doc, vp, size);
-                }
-                Instruction::Type(c, bold) => {
-                    {
-                        let mut lines = doc.lines.to_mut();
-                        let line = lines.get_mut(self.cursor.y as usize).unwrap();
-                        let mut line = line.to_mut();
-                        let spans = line.spans.len();
-                        line.spans
-                            .insert(self.cursor.x as usize, Span::new(c, self.foreground, bold));
-                        self.cursor.x += 1;
-                    }
-
-                    self.update_cursor(doc, vp, size);
-                }
-                Instruction::SetForeground(hex) => self.foreground = hex,
-                Instruction::Newline { x } => {
-                    self.cursor.x = x;
-                    self.cursor.y += 1;
-                    self.update_cursor(doc, vp, size);
-                }
-                Instruction::SetX(x) => {
-                    self.cursor.x = x as i32;
-                    self.update_cursor(doc, vp, size);
-                }
-                Instruction::Pause(_) => unreachable!(),
-                Instruction::Wait => doc.waiting.set(true.to_string()),
-                Instruction::HideCursor => {
-                    doc.show_cursor.set(false);
-                }
-            }
-        });
-    }
-}
-
-impl Component for Editor {
-    type Message = Instruction;
-    type State = Doc;
-
-    fn on_key(
-        &mut self,
-        key: KeyEvent,
-        state: &mut Self::State,
-        mut elements: Elements<'_, '_>,
-        _: Context<'_>,
-    ) {
-        state.waiting.set(false.to_string());
-        self.ack.send(());
-    }
-
-    fn message(
-        &mut self,
-        inst: Self::Message,
-        state: &mut Self::State,
-        mut elements: Elements<'_, '_>,
-        _: Context<'_>,
-    ) {
-        self.apply_inst(inst, state, elements);
-    }
+fn sleep_between_characters() {
+    let sleep = rand::thread_rng().gen_range(TYPING_DELAY_RANGE_MS);
+    thread::sleep(Duration::from_millis(sleep));
 }
 
 fn insts(lines: Box<[syntax::Line<'_>]>) -> Vec<Instruction> {
     let mut instructions = parse::Parser::new(lines).instructions();
     instructions.pop();
     instructions.insert(0, Instruction::Pause(1000));
-    // instructions.push(Instruction::HideCursor);
+    instructions.push(Instruction::WaitForQuit);
     instructions
+}
+
+fn enable_tui() {
+    let mut output = std::io::stdout();
+
+    let _ = output.execute(EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    _ = output.execute(cursor::Hide);
+}
+
+fn disable_tui() {
+    let mut screen = Screen::new((0, 0));
+    let _ = screen.restore(std::io::stdout());
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap();
 
-    let ext = path.rfind(".").unwrap();
-    let ext = &path[ext + 1..];
+    let action_file = read_to_string(&path).unwrap();
+    let actions = parse_actions(action_file);
 
-    let code = read_to_string(&path).unwrap();
-    let spans = syntax::highlight(&code, ext);
-    let mut instructions = insts(spans);
+    let mut output = std::io::stdout();
+    _ = output.execute(MoveTo(0, 0));
+    _ = output.execute(Clear(ClearType::All));
 
-    let mut doc = Document::new("@main");
+    let theme = ThemeSet::get_theme("themes/custom.stTheme").unwrap();
+    let base_path = env::current_dir().expect("Failed to get current directory");
 
-    let mut backend = TuiBackend::builder()
-        .enable_alt_screen()
-        .enable_raw_mode()
-        .hide_cursor()
-        .finish()
-        .unwrap();
+    wait_for_input();
+    for action in actions.iter() {
+        match action {
+            Action::ChangeDir(dir) => {
+                print_fake_cmd();
+                write_command(["cd", &**dir].iter().map(|el| *el));
+                cd(&**dir);
+                wait_for_input();
+            }
+            Action::ChangeDirQuiet(dir) => {
+                cd(&**dir);
+            }
+            Action::RunCommand(cmd) => {
+                print_fake_cmd();
+                write_command(cmd.iter().map(|el| &**el));
+                match run_command(cmd) {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("{}", ContentStyle::default().red().apply(e)),
+                }
+                wait_for_input();
+            }
+            Action::RunCommandOnlyOutput(cmd) => match run_command(cmd) {
+                Ok(_) => (),
+                Err(e) => eprintln!("{}", ContentStyle::default().red().apply(e)),
+            },
+            Action::RunCommandQuiet(cmd) => match run_command_quiet(cmd) {
+                Ok(_) => (),
+                Err(e) => eprintln!("{}", ContentStyle::default().red().apply(e)),
+            },
+            Action::RunEditor(dst, src) => {
+                print_fake_cmd();
+                write_command(["edit", dst].iter().map(|el| *el));
+                let Ok(dir) = env::current_dir() else {
+                    panic!("Could not acquire current directory")
+                };
+                let dst = dir.join(&**dst);
+                let src = dir.join(&**src);
+                match std::fs::copy(&src, &dst) {
+                    Ok(_) => (),
+                    Err(e) => panic!(
+                        "Failed to copy from {} to {}: {e}",
+                        src.display(),
+                        dst.display()
+                    ),
+                }
 
-    let mut runtime = Runtime::new(doc, backend);
+                let Some(extension) = dst.extension() else {
+                    panic!("File {} does not have an extension", dst.display())
+                };
+                let extension = match str::from_utf8(extension.as_encoded_bytes()) {
+                    Ok(v) => v,
+                    Err(e) => panic!(
+                        "{}: Failed to convert utf-8 to string: {e:?}!",
+                        dst.display()
+                    ),
+                };
 
-    let title = args.next().unwrap();
+                let code = read_to_string(&dst).unwrap();
+                let spans = syntax::highlight(&code, extension, &theme);
+                let instructions = insts(spans);
 
-    let (tx, rx) = mpsc::channel();
-    let cid = runtime
-        .register_component(
-            "main",
-            "components/index.aml",
-            Editor::new(tx),
-            Doc::new(title),
-        )
-        .unwrap();
-    runtime.register_component("status", "components/status.aml", (), ());
-    runtime.register_component("footer", "components/footer.aml", (), ());
+                let mut runtime = Runtime::builder(
+                    Document::new("@main"),
+                    QuittableTuiBackend(TuiBackend::builder().finish().unwrap()),
+                );
 
+                let editor_state = Doc::new(dst);
+
+                let current_dir = env::current_dir().expect("Failed to get working directory");
+                env::set_current_dir(&base_path).expect("Failed to set working directory to app root");
+                
+                let (tx, rx) = mpsc::channel();
+                let cid = runtime
+                .register_component("main", "components/index.aml", Editor::new(tx), editor_state)
+                .unwrap();
+            runtime
+                    .register_component("footer", "components/footer.aml", (), ())
+                    .unwrap();
+                runtime
+                    .register_component("folder_list", "components/folder_list.aml", (), ())
+                    .unwrap();
+                
+                run_editor(cid, runtime.finish().expect("Failed to build runtime"), rx, instructions);
+                
+                env::set_current_dir(current_dir).expect("Failed to restore working directory");
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    sleep_between_characters();
+    sleep_between_characters();
+}
+
+fn wait_for_input() {
+    let mut input = std::io::stdin();
+    enable_raw_mode().unwrap();
+
+    loop {
+        let mut buf = [0u8; 4];
+        let Ok(num_read) = input.read(&mut buf) else {
+            continue;
+        };
+        if num_read > 0 {
+            for n in &buf[0..num_read] {
+                if *n != 0 {
+                    disable_raw_mode().unwrap();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn cd(path: &str) {
+    if path.starts_with('/') {
+        env::set_current_dir(PathBuf::from(path)).expect("Failed to set current dir");
+    } else if path.starts_with('~') {
+        let Some(homedir) = home_dir() else {
+            panic!("Could not acquire home directory")
+        };
+        env::set_current_dir(homedir.join(path)).expect("Failed to set current dir");
+    } else {
+        let Ok(dir) = env::current_dir() else {
+            panic!("Could not acquire current directory")
+        };
+        env::set_current_dir(dir.join(path)).expect("Failed to set current dir");
+    }
+}
+
+struct FakeCmdPrinter;
+
+impl Display for FakeCmdPrinter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = env::current_dir().unwrap_or_else(|_| PathBuf::new());
+        match home_dir() {
+            None => path.display().fmt(f),
+            Some(v) => match path.strip_prefix(v) {
+                Err(..) => path.display().fmt(f),
+                Ok(v) => {
+                    f.write_str("~/")?;
+                    v.display().fmt(f)
+                }
+            },
+        }?;
+        f.write_str(" $ ")
+    }
+}
+
+fn print_fake_cmd() {
+    print!("{}", ContentStyle::default().green().apply(FakeCmdPrinter));
+    _ = std::io::stdout().flush();
+}
+
+fn write_command<'a>(mut cmd: impl Iterator<Item = &'a str>) {
+    let Some(cmd_name) = cmd.next() else {
+        return;
+    };
+
+    print!("\x1b[{}m", Colored::ForegroundColor(Color::Cyan));
+    write_str_typing(cmd_name);
+
+    print!("\x1b[{}m", Colored::ForegroundColor(Color::Reset));
+    let mut output = std::io::stdout();
+    _ = output.flush();
+    for arg in cmd {
+        print!(" ");
+        _ = output.flush();
+        sleep_between_characters();
+        write_str_typing(arg);
+    }
+    print!("\n");
+    _ = std::io::stdout().flush();
+}
+
+fn write_str_typing(value: &str) {
+    let mut output = std::io::stdout();
+    for c in value.chars() {
+        let mut data = [0u8; 4];
+        _ = output.write(c.encode_utf8(&mut data).as_bytes());
+        _ = output.flush();
+        sleep_between_characters();
+    }
+}
+
+fn run_editor(
+    cid: ComponentId<Instruction>,
+    mut runtime: Runtime<QuittableTuiBackend>,
+    rx: Receiver<()>,
+    instructions: Vec<Instruction>,
+) {
     let emitter = runtime.emitter();
 
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         for i in instructions {
             if let Instruction::Pause(ms) = i {
                 thread::sleep(Duration::from_millis(ms));
@@ -263,19 +287,31 @@ fn main() {
             }
 
             if let Instruction::Wait = i {
-                emitter.emit(cid, i);
-                rx.recv();
+                _ = emitter.emit(cid, i);
+                _ = rx.recv();
                 continue;
             }
 
-            use rand::Rng;
-            let sleep = rand::thread_rng().gen_range(35..85);
-            // let sleep = rand::thread_rng().gen_range(3..5);
-            std::thread::sleep(Duration::from_millis(sleep));
-            emitter.emit(cid, i);
+            if let Instruction::WaitForQuit = i {
+                _ = rx.recv();
+                if let Ok(mut should_quit) = SHOULD_QUIT.lock() {
+                    *should_quit = true;
+                }
+                return;
+            }
+            _ = rx.try_recv();
+
+            sleep_between_characters();
+            _ = emitter.emit(cid, i);
+        }
+
+        _ = rx.recv();
+        if let Ok(mut should_quit) = SHOULD_QUIT.lock() {
+            *should_quit = true;
         }
     });
 
-    let mut runtime = runtime.finish().unwrap();
+    enable_tui();
     runtime.run();
+    disable_tui();
 }

@@ -1,3 +1,5 @@
-hstack [background: "grey", foreground: "black"]
-    text x ", " y
+hstack [background: "dark_grey", foreground: "grey"]
+    text " "
+    text title
     spacer
+    text x ", " y "  "

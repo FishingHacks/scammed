@@ -1,16 +1,11 @@
 vstack
-    @status { waiting: waiting }
+    //@status { waiting: waiting }
 
     expand
         hstack
             border [sides: "right"]
                 expand [axis: "vertical"]
-                    padding [padding: 1]
-                        vstack
-                            text [foreground: "cyan"] "../"
-                            text [foreground: "cyan"] "src/"
-                            text [bold: true] "> main.rs"
-                            text  "Cargo.toml"
+                    @folder_list { tree: tree }
             overflow
                 for line in lines
                     // The container keeps the row from being zero sized

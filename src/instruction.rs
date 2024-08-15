@@ -1,6 +1,8 @@
+use std::{path::PathBuf, sync::mpsc::Sender};
+
 use anathema::state::Hex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Instruction {
     MoveCursor(u16, u16),
     Type(char, bool),
@@ -9,5 +11,7 @@ pub enum Instruction {
     SetX(i32),
     Pause(u64),
     Wait,
+    WaitForQuit,
+    UpdateState(PathBuf, Sender<()>),
     HideCursor,
 }

@@ -1,0 +1,13 @@
+padding [padding: 1]
+    vstack
+        text [foreground: "cyan"] "../"
+
+        for dir in folder_list
+            text [foreground: "cyan"] dir "/"
+        text [bold: true] file_name
+
+        for f in tree.folders
+            text [foreground: "cyan"] f "/"
+
+        for f in tree.files
+            text f

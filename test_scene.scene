@@ -1,0 +1,10 @@
+#mkdir test
+#cd test
+#mkdir b
+#mkdir c
+#touch d
+#touch e
+cargo init . --name "test_scene"
++ "src/main.rs" "../testcode.rs"
+cargo r
+-echo "Good Job!!"
